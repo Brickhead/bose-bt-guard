@@ -52,19 +52,16 @@ public sealed class Settings
     public int WatchdogSeconds { get; set; } = 60;
 
     /// <summary>
-    /// LE link down while the headphones stay on: they advertise "connect me", which Windows
-    /// ignores. Scan for that while no link is up. LogOnly records what is seen; Wake also runs
-    /// "Wake LE link" on a connectable advertisement from the headphones (right after a
-    /// disconnect only once they kept advertising for 5 s; at most once a minute).
+    /// While no link is up, scan for the headphones' advertisements. LogOnly records what is
+    /// seen; Wake also runs "Wake LE link" when they send a Targeted announcement ("paired PC,
+    /// connect now"), never on a General one (sent while going to sleep). At most 3 wakes per
+    /// 10 min, 60 s apart.
     /// </summary>
     public AdvertScanModes AdvertScanMode { get; set; } = AdvertScanModes.Wake;
 
     public bool StepLeWake { get; set; } = true;
     public bool StepKsReconnect { get; set; } = true;
     public bool StepLeAudioRestart { get; set; } = true;
-    /// <summary>Off by default: on this setup the headphones do not reconnect after an adapter restart.</summary>
-    public bool StepAdapterRestart { get; set; } = false;
-    public bool StepAudioServiceRestart { get; set; } = false;
 
     public static Settings Load()
     {
@@ -94,7 +91,7 @@ public sealed class Settings
         LeWakeHoldSeconds = Math.Clamp(LeWakeHoldSeconds, 5, 60);
         WatchdogSeconds = WatchdogSeconds <= 0 ? 0 : Math.Clamp(WatchdogSeconds, 15, 3600);
         if (!Enum.IsDefined(AdvertScanMode))
-            AdvertScanMode = AdvertScanModes.LogOnly;
+            AdvertScanMode = new Settings().AdvertScanMode;
         return this;
     }
 

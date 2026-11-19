@@ -67,9 +67,6 @@ internal sealed class TrayApp : ApplicationContext
             }
         };
         _form.SettingsSaved += () => _autoFixItem.Checked = _settings.AutoFix;
-
-        _ = Task.Run(async () =>
-            Log.Info($"Bluetooth adapter: {await AdapterControl.GetInstanceIdAsync() ?? "not found"}"));
     }
 
     private void UpdateTray(GuardStatus status)

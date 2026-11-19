@@ -33,9 +33,6 @@ public sealed class AudioEndpoints : IMMNotificationClient, IDisposable
     /// </summary>
     public event Action? Changed;
 
-    /// <summary>Raised when Windows changes a default device. Same threading rule as <see cref="Changed"/>.</summary>
-    public event Action<DataFlow, Role, string>? DefaultChanged;
-
     /// <summary>Matching endpoints of one direction, in every state (NotPresent included).</summary>
     public static List<EndpointInfo> Find(string match, DataFlow flow = DataFlow.Render)
     {
@@ -72,18 +69,6 @@ public sealed class AudioEndpoints : IMMNotificationClient, IDisposable
                 result.Add(new EndpointInfo(device.ID, name, flow, device.State, device.ID == defaultId));
         }
         return result;
-    }
-
-    public static string NameOf(string endpointId)
-    {
-        try
-        {
-            return new MMDeviceEnumerator().GetDevice(endpointId).FriendlyName;
-        }
-        catch
-        {
-            return endpointId;
-        }
     }
 
     /// <summary>
@@ -299,6 +284,25 @@ public sealed class AudioEndpoints : IMMNotificationClient, IDisposable
     }
 
     /// <summary>
+    /// Apps audibly playing to a matching output right now, e.g. "Spotify peak 0.41", or null.
+    /// </summary>
+    public static string? DescribeAudiblePlayback(string match)
+    {
+        var scan = ScanSessions(match);
+        if (scan is null)
+            return null;
+        var playing = scan
+            .Where(e => e.Flow == DataFlow.Render && e.Sessions is not null)
+            .SelectMany(e => e.Sessions!)
+            .Where(x => x.Active && x.Peak > AudiblePeak)
+            .Select(x => $"{x.Process} peak {x.Peak:0.00}")
+            .ToList();
+        return playing.Count == 0 ? null : string.Join(", ", playing);
+    }
+
+    private const float AudiblePeak = 0.0005f;
+
+    /// <summary>
     /// True when another app has an active session on a matching output. With
     /// <paramref name="audible"/>, the session must also have a level above silence right now:
     /// games and browsers keep sessions active while silent.
@@ -308,7 +312,7 @@ public sealed class AudioEndpoints : IMMNotificationClient, IDisposable
         var scan = ScanSessions(match);
         return scan is not null && scan.Any(e =>
             e.Flow == DataFlow.Render && e.Sessions is not null &&
-            e.Sessions.Any(x => x.Active && (!audible || x.Peak > 0.0005f)));
+            e.Sessions.Any(x => x.Active && (!audible || x.Peak > AudiblePeak)));
     }
 
     private static string ProcessName(uint pid)
@@ -334,7 +338,6 @@ public sealed class AudioEndpoints : IMMNotificationClient, IDisposable
 
     public void OnDefaultDeviceChanged(DataFlow flow, Role role, string defaultDeviceId)
     {
-        DefaultChanged?.Invoke(flow, role, defaultDeviceId);
         if (flow == DataFlow.Render && role == Role.Multimedia)
             Changed?.Invoke();
     }

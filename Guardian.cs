@@ -34,11 +34,10 @@ public sealed class Guardian : IDisposable
     private CancellationTokenSource? _pendingCheck;
     // Lives as long as one Build(): cancels the startup check and the watchdog on Teardown.
     private CancellationTokenSource _buildLife = new();
-    private string _lastSessions = "";
     private volatile GuardStatus _status = new(GuardState.Starting, "");
 
     // True while a fix step runs. Connect/disconnect events in that window are caused by the
-    // step itself (forced LE connect, driver or adapter restart) and must not trigger another check.
+    // step itself (forced LE connect, driver restart) and must not trigger another check.
     private volatile bool _fixing;
 
     // Connect events shortly after a fix are usually late echoes of the fix itself (KS reconnect,
@@ -51,29 +50,30 @@ public sealed class Guardian : IDisposable
     private DateTime _lastFailedAutoFixUtc = DateTime.MinValue;
     private Dictionary<string, EndpointInfo> _endpoints = [];
 
-    // Advertisement scan (headphones on, but nothing connects).
+    // Advertisement scan while nothing is connected. An "episode" is one unbroken run of
+    // advertisements from the headphones; its announcement decides whether to wake them.
     private AdvertScanner _scanner = null!;
     private volatile bool _startupDone;
-    // An "episode" is one unbroken run of advertisements from the headphones. Its cause decides
-    // whether waking them is safe (see WakeDecision).
-    private enum EpisodeCause { Unknown, LeDropWhilePlaying, LeDropIdle, PowerOn }
-
+    private readonly object _advertGate = new();
     private DateTime _lastLinkChangeUtc = DateTime.MinValue;
     private DateTime _lastLeDropUtc = DateTime.MinValue;
-    private bool _playingAtLeDrop;
-    private long _lastPlaybackTicks; // UTC ticks of the last time an app was seen playing to the headphones
+    private long _lastPlaybackTicks; // UTC ticks of the last time an app was heard playing to the headphones
+    private string _lastPlayback = ""; // which app, e.g. "Spotify peak 0.41"
     private DateTime _lastHeadsetAdvertUtc = DateTime.MinValue;
     private DateTime _episodeStartUtc = DateTime.MinValue;
-    private EpisodeCause _episodeCause;
-    private int _episodeWakes;
-    private string _episodeDecision = "";
     private LeAnnouncement _episodeAnnouncement;
+    private string _episodeDecision = "";
     private readonly HashSet<string> _episodePayloads = [];
+
+    // Advertisement wakes actually started, for the rate limit (not reset by link changes, which
+    // the wake itself causes).
+    private readonly Queue<DateTime> _advertWakes = new();
     private DateTime _lastAdvertWakeUtc = DateTime.MinValue;
 
-    private static readonly TimeSpan SilenceForPowerOn = TimeSpan.FromSeconds(45);
-    private static readonly TimeSpan SustainedAdvertising = TimeSpan.FromSeconds(5);
-    private readonly object _advertGate = new();
+    private static readonly TimeSpan EpisodeGap = TimeSpan.FromSeconds(45);
+    private const int MaxAdvertWakes = 3;
+    private static readonly TimeSpan AdvertWakeWindow = TimeSpan.FromMinutes(10);
+    private static readonly TimeSpan AdvertWakeSpacing = TimeSpan.FromSeconds(60);
 
     public Guardian(Settings settings)
     {
@@ -92,9 +92,6 @@ public sealed class Guardian : IDisposable
     public event Action<GuardStatus>? StateChanged;
 
     public event Action? DevicesChanged;
-
-    /// <summary>Every advertisement that may be the headphones (for the Advertisements window).</summary>
-    public event Action<AdvertSeen>? AdvertObserved;
 
     public IReadOnlyList<BtDevice> BluetoothDevices => _bluetooth.Snapshot();
 
@@ -162,7 +159,6 @@ public sealed class Guardian : IDisposable
 
         _audio = new AudioEndpoints();
         _audio.Changed += OnEndpointNotification;
-        _audio.DefaultChanged += OnDefaultChanged;
 
         _buildLife.Dispose();
         _buildLife = new CancellationTokenSource();
@@ -200,7 +196,6 @@ public sealed class Guardian : IDisposable
         _bluetooth.ListChanged -= OnBluetoothListChanged;
         _bluetooth.Dispose();
         _audio.Changed -= OnEndpointNotification;
-        _audio.DefaultChanged -= OnDefaultChanged;
         _audio.Dispose();
         _scanner.Seen -= OnAdvertSeen;
         _scanner.Dispose();
@@ -214,9 +209,6 @@ public sealed class Guardian : IDisposable
 
     // Core Audio forbids calls back into it from the notification thread, so hop off.
     private void OnEndpointNotification() => Task.Run(RefreshEndpoints);
-
-    private void OnDefaultChanged(DataFlow flow, Role role, string endpointId) => Task.Run(() =>
-        Log.Info($"Windows default {(flow == DataFlow.Render ? "output" : "input")} ({role}) -> {AudioEndpoints.NameOf(endpointId)}"));
 
     private void RefreshEndpoints()
     {
@@ -269,17 +261,22 @@ public sealed class Guardian : IDisposable
         // Tracked even during a fix: the advertisement wake needs to know how each advertising
         // episode began.
         var now = DateTime.UtcNow;
+        bool leDrop = device.Protocol == "LE" && !device.Connected;
+        string? playingAtDrop = null;
         lock (_advertGate)
         {
             _lastLinkChangeUtc = now;
-            if (device.Protocol == "LE" && !device.Connected)
+            if (leDrop)
             {
                 _lastLeDropUtc = now;
-                _playingAtLeDrop = now - new DateTime(Interlocked.Read(ref _lastPlaybackTicks), DateTimeKind.Utc) < TimeSpan.FromSeconds(12);
+                if (now - new DateTime(Interlocked.Read(ref _lastPlaybackTicks), DateTimeKind.Utc) < TimeSpan.FromSeconds(12))
+                    playingAtDrop = Volatile.Read(ref _lastPlayback);
             }
         }
-        if (device.Protocol == "LE" && !device.Connected)
-            Log.Info($"LE link dropped {(_playingAtLeDrop ? "while audio was playing" : "with nothing playing")}");
+        // Evidence only: whether a drop happened during playback (and what played) is what tells a
+        // drop while worn apart from the headset going to sleep, which we have not captured yet.
+        if (leDrop)
+            Log.Info(playingAtDrop is null ? "LE link dropped with nothing playing" : $"LE link dropped while audio was playing ({playingAtDrop})");
         UpdateScanner();
         _ = Task.Run(DevNode.RecoverPending); // a node a failed enable left disabled
 
@@ -296,13 +293,23 @@ public sealed class Guardian : IDisposable
             if (!_bluetooth.AnyConnected)
             {
                 Interlocked.Exchange(ref _pendingCheck, null)?.Cancel();
-                _lastSessions = "";
                 SetState(GuardState.Disconnected, "headphones off");
+                return;
             }
+            // LE (the audio link) dropped while Classic stays up: audio is gone, and nothing else
+            // would notice (the scan only runs with no link up, the watchdog only with LE up).
+            // Check like after a connect; Wake LE link aborts if Classic drops meanwhile.
+            if (leDrop)
+                ScheduleCheck("LE link dropped, Classic still up");
             return;
         }
 
-        // LE and Classic entries both connect within a moment of each other: debounce to one check.
+        ScheduleCheck("headphones connected");
+    }
+
+    /// <summary>Debounced check: LE and Classic events arrive within a moment of each other.</summary>
+    private void ScheduleCheck(string reason)
+    {
         var cts = new CancellationTokenSource();
         var previous = Interlocked.Exchange(ref _pendingCheck, cts);
         previous?.Cancel();
@@ -318,13 +325,13 @@ public sealed class Guardian : IDisposable
             {
                 return;
             }
-            await RunCoreAsync(Settings.AutoFix, manual: false, "headphones connected", watchdog: false);
+            await RunCoreAsync(Settings.AutoFix, manual: false, reason, watchdog: false);
         });
     }
 
     /// <summary>
-    /// While the LE link is up: logs which apps hold streams whenever that changes. While an app
-    /// is playing and audio is OK, re-tests the stream so a stall during use (frozen video, silent
+    /// While the LE link is up: notes when audio is playing (logged with an LE drop). While an
+    /// app is playing and audio is OK, re-tests the stream so a stall during use (frozen video, silent
     /// Spotify) is caught. While Stalled, re-tests so the status turns green again on recovery.
     /// No probe while nothing plays: it would be pointless and could keep the headset from
     /// switching itself off when idle.
@@ -339,11 +346,12 @@ public sealed class Guardian : IDisposable
             {
                 await Task.Delay(TimeSpan.FromSeconds(5), token);
 
-                // Remember when something last played to the headphones: an LE drop during playback
-                // is an interruption worth fixing, one with nothing playing is the headset going to sleep.
+                // Remember when (and what) last played to the headphones, so an LE drop can be logged
+                // as "during playback" or not.
                 if (!_fixing && _bluetooth.LeDevice?.Connected == true &&
-                    await Task.Run(() => AudioEndpoints.HasActivePlayback(Settings.DeviceNameMatch, audible: true), token))
+                    await Task.Run(() => AudioEndpoints.DescribeAudiblePlayback(Settings.DeviceNameMatch), token) is { } playing)
                 {
+                    Volatile.Write(ref _lastPlayback, playing);
                     Interlocked.Exchange(ref _lastPlaybackTicks, DateTime.UtcNow.Ticks);
                 }
 
@@ -357,13 +365,6 @@ public sealed class Guardian : IDisposable
                 // link and keep the headphones from turning off.
                 if (_fixing || _bluetooth.LeDevice?.Connected != true)
                     continue;
-
-                string sessions = await Task.Run(() => AudioEndpoints.DescribeSessions(Settings.DeviceNameMatch), token);
-                if (sessions != _lastSessions)
-                {
-                    Log.Info($"Sessions: {sessions}");
-                    _lastSessions = sessions;
-                }
 
                 // Never probe while nothing plays (also while Stalled): pointless, and it could keep
                 // the headset from switching itself off when idle.
@@ -405,39 +406,22 @@ public sealed class Guardian : IDisposable
 
     private void OnAdvertSeen(AdvertSeen seen)
     {
-        try
-        {
-            AdvertObserved?.Invoke(seen);
-        }
-        catch
-        {
-            // A closing window must not break the scan.
-        }
-
-        if (!seen.Strong || _bluetooth.AnyConnected)
-            return; // only our headphones decide anything; connected: the scan is about to stop
+        if (_bluetooth.AnyConnected)
+            return; // the scan is about to stop
 
         var lines = new List<string>();
         string decision;
         lock (_advertGate)
         {
             var now = DateTime.UtcNow;
-            var gap = now - _lastHeadsetAdvertUtc;
-            if (_episodeStartUtc < _lastLinkChangeUtc || gap >= SilenceForPowerOn)
+            if (_episodeStartUtc < _lastLinkChangeUtc || now - _lastHeadsetAdvertUtc >= EpisodeGap)
             {
                 _episodeStartUtc = now;
-                _episodeWakes = 0;
                 _episodeDecision = "";
                 _episodeAnnouncement = LeAnnouncement.None;
                 _episodePayloads.Clear();
-                var scanSince = _scanner.RunningSinceUtc;
-                _episodeCause =
-                    now - _lastLeDropUtc < TimeSpan.FromSeconds(15)
-                        ? (_playingAtLeDrop ? EpisodeCause.LeDropWhilePlaying : EpisodeCause.LeDropIdle)
-                    : scanSince is { } since && now - since >= SilenceForPowerOn && gap >= SilenceForPowerOn
-                        ? EpisodeCause.PowerOn
-                        : EpisodeCause.Unknown;
-                lines.Add($"Headphones advertising, {Describe(_episodeCause)}: {seen.Describe()}");
+                string after = now - _lastLeDropUtc < TimeSpan.FromSeconds(15) ? " (right after an LE drop)" : "";
+                lines.Add($"Headphones advertising{after}: {seen.Describe()}");
             }
             _lastHeadsetAdvertUtc = now;
 
@@ -449,16 +433,16 @@ public sealed class Guardian : IDisposable
                 _episodeAnnouncement = seen.Announcement;
             }
 
-            // Each distinct payload once per episode (capped): the history needed to spot a byte
-            // that changes when the headphones are put on.
-            if (_episodePayloads.Count < 20 && _episodePayloads.Add(seen.DescribePayload()))
-                lines.Add($"  payload {seen.DescribePayload()}");
+            // Each distinct payload once per episode, capped: evidence for cases not yet understood
+            // (what a worn headset sends after an LE drop).
+            if (_episodePayloads.Count < 8 && seen.Payload.Length > 0 && _episodePayloads.Add(seen.Payload))
+                lines.Add($"  payload {seen.Payload}");
 
-            decision = WakeDecisionLocked(seen, now);
+            decision = WakeDecisionLocked(now);
             if (decision != _episodeDecision)
             {
                 _episodeDecision = decision;
-                if (decision != "wake")
+                if (decision is not ("wake" or "busy"))
                     lines.Add($"  -> {decision}");
             }
         }
@@ -467,7 +451,7 @@ public sealed class Guardian : IDisposable
             Log.Info(line);
 
         if (decision == "wake")
-            _ = Task.Run(() => WakeFromAdvertisementAsync(seen));
+            _ = Task.Run(WakeFromAdvertisementAsync);
     }
 
     private static string Describe(LeAnnouncement announcement) => announcement switch
@@ -477,55 +461,61 @@ public sealed class Guardian : IDisposable
         _ => "none yet",
     };
 
-    private static string Describe(EpisodeCause cause) => cause switch
-    {
-        EpisodeCause.LeDropWhilePlaying => "LE dropped while audio was playing",
-        EpisodeCause.LeDropIdle => "LE dropped with nothing playing",
-        EpisodeCause.PowerOn => "after silence (switched on)",
-        _ => "was already advertising when the scan started",
-    };
-
     /// <summary>
-    /// "wake", or the reason not to. Decided per episode, not per advertisement: the headset
-    /// alternates legacy advertisements (no announcement) with extended ones (announcement).
-    /// - Targeted announcement: the headset asks its paired PC to connect (seen right after it
-    ///   is switched on). Windows ignores it; this answers it.
-    /// - General announcement: only "available". Seen while it lies on the table going to sleep;
-    ///   answering it keeps it awake. Never woken.
-    /// - Fallback without Targeted: the LE link dropped while audio was audibly playing (an
-    ///   interruption), after 5 s of advertising (a headset switched off stops within a second).
+    /// "wake", "busy", or the reason not to. Decided per episode: the headset alternates legacy
+    /// advertisements (no announcement) with extended ones (announcement). Only a Targeted
+    /// announcement wakes: the headset asks its paired PC to connect (seen when it is picked up
+    /// after sleeping on the table; Windows ignores it). A General announcement only means
+    /// "available" and is what it sends while lying on the table for 10-20 min; answering it
+    /// keeps it awake. No other trigger: anything else risks waking a headset going to sleep.
     /// </summary>
-    private string WakeDecisionLocked(AdvertSeen seen, DateTime now)
+    private string WakeDecisionLocked(DateTime now)
     {
         if (Settings.AdvertScanMode != AdvertScanModes.Wake)
             return "log only";
-
-        bool targeted = _episodeAnnouncement == LeAnnouncement.Targeted;
-        bool interrupted = _episodeCause == EpisodeCause.LeDropWhilePlaying;
-        if (!targeted && !interrupted)
+        if (_episodeAnnouncement != LeAnnouncement.Targeted)
         {
             return _episodeAnnouncement == LeAnnouncement.General
                 ? "not acting: general announcement (available, not asking the PC to connect)"
                 : "not acting: no targeted announcement";
         }
-        if (!targeted && now - _episodeStartUtc < SustainedAdvertising)
-            return $"waiting for {SustainedAdvertising.TotalSeconds:0} s of advertising";
         if (_fixing || _busy.CurrentCount == 0)
-            return "not acting: a check or fix is running";
-        if (_episodeWakes >= 2)
-            return "not acting: tried twice in this episode";
-        if (now - _lastAdvertWakeUtc < TimeSpan.FromSeconds(60))
-            return "not acting: tried less than 60 s ago";
+            return "busy";
 
-        _episodeWakes++;
-        _lastAdvertWakeUtc = now;
+        PruneAdvertWakes(now);
+        if (_advertWakes.Count >= MaxAdvertWakes)
+            return $"not acting: {MaxAdvertWakes} wakes in the last {AdvertWakeWindow.TotalMinutes:0} min";
+        if (now - _lastAdvertWakeUtc < AdvertWakeSpacing)
+            return $"waiting: woke less than {AdvertWakeSpacing.TotalSeconds:0} s ago";
         return "wake";
     }
 
-    private async Task WakeFromAdvertisementAsync(AdvertSeen seen)
+    private void PruneAdvertWakes(DateTime now)
+    {
+        while (_advertWakes.Count > 0 && now - _advertWakes.Peek() > AdvertWakeWindow)
+            _advertWakes.Dequeue();
+    }
+
+    private async Task WakeFromAdvertisementAsync()
     {
         if (!await _busy.WaitAsync(0))
-            return;
+            return; // another check or fix is running; it handles the headphones
+
+        lock (_advertGate)
+        {
+            // Several advertisements can ask for a wake before the first one runs: re-check here,
+            // and count only wakes that really start.
+            var now = DateTime.UtcNow;
+            PruneAdvertWakes(now);
+            if (_advertWakes.Count >= MaxAdvertWakes ||
+                now - _lastAdvertWakeUtc < AdvertWakeSpacing)
+            {
+                _busy.Release();
+                return;
+            }
+            _advertWakes.Enqueue(now);
+            _lastAdvertWakeUtc = now;
+        }
 
         bool woke = false;
         _fixing = true;
@@ -534,7 +524,7 @@ public sealed class Guardian : IDisposable
             if (_bluetooth.AnyConnected)
                 return; // connected on its own meanwhile: checked below
 
-            Log.Info($"--- Headphones advertising ({Describe(_episodeCause)}, announcement {Describe(_episodeAnnouncement)}): Wake LE link ---");
+            Log.Info("--- Wake LE link (headphones ask to connect) ---");
             SetState(GuardState.Fixing, "Wake LE link (headphones advertising)");
             var (ok, detail) = await WakeLeLinkAsync();
             Log.Info($"  Wake LE link: {(ok ? "done" : "failed")}: {detail}");
@@ -821,12 +811,6 @@ public sealed class Guardian : IDisposable
         if (Settings.StepLeAudioRestart)
             yield return new FixStep("Restart LE Audio driver", RestartLeAudioDriverAsync, SettleAfterDriverRestartAsync);
 
-        if (Settings.StepAdapterRestart)
-            yield return new FixStep("Restart Bluetooth adapter", AdapterControl.RestartAsync,
-                () => WaitForReconnectAsync(TimeSpan.FromSeconds(25)));
-
-        if (Settings.StepAudioServiceRestart)
-            yield return new FixStep("Restart Windows audio services", AudioServices.RestartAsync, () => Task.Delay(5000));
     }
 
     public Task<(bool Ok, string Detail)> ReconnectEndpointsAsync() => Task.Run<(bool Ok, string Detail)>(() =>
@@ -929,20 +913,6 @@ public sealed class Guardian : IDisposable
         {
             return false;
         }
-    }
-
-    private async Task WaitForReconnectAsync(TimeSpan max)
-    {
-        var stopwatch = Stopwatch.StartNew();
-        await Task.Delay(3000); // connection state needs a moment to drop after the adapter restart
-        while (stopwatch.Elapsed < max && !_bluetooth.AnyConnected)
-            await Task.Delay(500);
-
-        Log.Info(_bluetooth.AnyConnected
-            ? $"  Headphones back after {stopwatch.Elapsed.TotalSeconds:0} s"
-            : "  Headphones did not reconnect after adapter restart");
-
-        await Task.Delay(TimeSpan.FromSeconds(Settings.SettleSeconds));
     }
 
     private Task<CheckResult> CheckAsync(bool setDefault) => Task.Run(() =>

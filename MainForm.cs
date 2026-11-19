@@ -9,7 +9,6 @@ internal sealed class MainForm : Form
     private const int MaxLogChars = 200_000;
 
     private readonly Guardian _guardian;
-    private AdvertForm? _adverts;
     private readonly Label _status = new()
     {
         AutoSize = true,
@@ -48,8 +47,6 @@ internal sealed class MainForm : Form
     private readonly CheckBox _stepLe = new() { Text = "Wake LE link", AutoSize = true };
     private readonly CheckBox _stepKs = new() { Text = "Reconnect headphones (KS)", AutoSize = true };
     private readonly CheckBox _stepLeAudio = new() { Text = "Restart LE Audio driver", AutoSize = true };
-    private readonly CheckBox _stepAdapter = new() { Text = "Restart adapter", AutoSize = true };
-    private readonly CheckBox _stepServices = new() { Text = "Restart audio services", AutoSize = true };
     private bool _allowClose;
 
     public MainForm(Guardian guardian)
@@ -73,16 +70,8 @@ internal sealed class MainForm : Form
         actions.Controls.Add(MakeButton("Wake LE link", () => _guardian.RunManualStepAsync("Wake LE link", _guardian.WakeLeLinkAsync)));
         actions.Controls.Add(MakeButton("Reconnect headphones (KS)", () => _guardian.RunManualStepAsync("Reconnect headphones (KS)", _guardian.ReconnectEndpointsAsync)));
         actions.Controls.Add(MakeButton("Restart LE Audio driver", () => _guardian.RunManualStepAsync("Restart LE Audio driver", _guardian.RestartLeAudioDriverAsync)));
-        actions.Controls.Add(MakeButton("Restart adapter", () => _guardian.RunManualStepAsync("Restart adapter", AdapterControl.RestartAsync)));
         actions.Controls.Add(MakeButton("Restart audio services", () => _guardian.RunManualStepAsync("Restart audio services", AudioServices.RestartAsync)));
         actions.Controls.Add(MakeButton("Open log file", OpenLogFile));
-        actions.Controls.Add(MakeButton("Advertisements...", () =>
-        {
-            _adverts ??= new AdvertForm(_guardian);
-            _adverts.Show();
-            _adverts.Activate();
-            return Task.CompletedTask;
-        }));
 
         var settings = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, Margin = new Padding(0, 6, 0, 6) };
         settings.Controls.Add(FieldLabel("Device name contains"));
@@ -102,8 +91,6 @@ internal sealed class MainForm : Form
         settings.Controls.Add(_stepLe);
         settings.Controls.Add(_stepKs);
         settings.Controls.Add(_stepLeAudio);
-        settings.Controls.Add(_stepAdapter);
-        settings.Controls.Add(_stepServices);
         settings.Controls.Add(MakeButton("Save settings", () =>
         {
             SaveSettings();
@@ -141,19 +128,7 @@ internal sealed class MainForm : Form
 
     public event Action? SettingsSaved;
 
-    public void AllowClose()
-    {
-        _allowClose = true;
-        _adverts?.AllowClose();
-        _adverts?.Close();
-    }
-
-    protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-            _adverts?.Dispose();
-        base.Dispose(disposing);
-    }
+    public void AllowClose() => _allowClose = true;
 
     public void LoadSettingsIntoUi()
     {
@@ -168,8 +143,6 @@ internal sealed class MainForm : Form
         _stepLe.Checked = s.StepLeWake;
         _stepKs.Checked = s.StepKsReconnect;
         _stepLeAudio.Checked = s.StepLeAudioRestart;
-        _stepAdapter.Checked = s.StepAdapterRestart;
-        _stepServices.Checked = s.StepAudioServiceRestart;
     }
 
     protected override void OnFormClosing(FormClosingEventArgs e)
@@ -206,8 +179,6 @@ internal sealed class MainForm : Form
         s.StepLeWake = _stepLe.Checked;
         s.StepKsReconnect = _stepKs.Checked;
         s.StepLeAudioRestart = _stepLeAudio.Checked;
-        s.StepAdapterRestart = _stepAdapter.Checked;
-        s.StepAudioServiceRestart = _stepServices.Checked;
         s.Normalized().Save();
         LoadSettingsIntoUi(); // show values as clamped
         Log.Info("Settings saved");

@@ -6,8 +6,8 @@ namespace BtAudioGuard;
 /// <summary>
 /// LE Audio announcement type, carried in the service data of the Common Audio Service (0x1853)
 /// and the Audio Stream Control Service (0x184E). General: "available". Targeted: "I want my
-/// paired central to connect now". Observed on this headset: General while it lies on the
-/// table, Targeted right after it is switched on.
+/// paired central to connect now". Observed on this headset: General for 10-20 min while it lies
+/// on the table, Targeted for a few seconds when it is picked up after sleeping.
 /// </summary>
 public enum LeAnnouncement
 {
@@ -16,35 +16,20 @@ public enum LeAnnouncement
     Targeted,
 }
 
-/// <summary>One advertisement that looks like it comes from the headphones.</summary>
+/// <summary>One advertisement from the headphones (matched by their address or name).</summary>
 public sealed record AdvertSeen(
     ulong Address,
-    string AddressType,
     bool AddressMatch,
-    bool NameMatch,
-    bool BoseData,
     string Name,
     short Rssi,
-    string Kind,
     bool Connectable,
-    bool ScanResponse,
-    string Services,
-    string Payload,
-    LeAnnouncement Announcement)
+    LeAnnouncement Announcement,
+    string Payload)
 {
-    /// <summary>Strong enough to act on: our headphones' own address, or their name.</summary>
-    public bool Strong => AddressMatch || NameMatch;
-
     public string Describe() =>
-        $"{Address:X12} ({AddressType}{(AddressMatch ? ", identity match" : "")}) " +
-        $"name '{Name}'{(NameMatch ? " (match)" : "")}, rssi {Rssi} dBm, {Kind}" +
-        $"{(Connectable ? ", connectable" : "")}{(ScanResponse ? ", scan response" : "")}" +
-        $"{(BoseData ? ", Bose data" : "")}{(Services.Length > 0 ? $", services {Services}" : "")}" +
+        $"{Address:X12} ({(AddressMatch ? "address match" : $"name '{Name}'")}), rssi {Rssi} dBm" +
+        $"{(Connectable ? ", connectable" : "")}" +
         $"{(Announcement != LeAnnouncement.None ? $", {Announcement.ToString().ToLowerInvariant()} announcement" : "")}";
-
-    /// <summary>The raw advertisement content: one "type:hex" entry per AD structure.
-    /// FF = manufacturer data (first two bytes 9E00 = Bose), 16 = service data, 09 = name.</summary>
-    public string DescribePayload() => $"{Kind}{(ScanResponse ? " (scan response)" : "")}: {Payload}";
 }
 
 /// <summary>
@@ -55,16 +40,11 @@ public sealed record AdvertSeen(
 /// </summary>
 internal sealed class AdvertScanner : IDisposable
 {
-    private const ushort BoseCompanyId = 0x009E;
-
     private readonly BluetoothLEAdvertisementWatcher _watcher;
     private readonly Func<string> _nameMatch;
     private readonly Func<ulong?> _identityAddress;
     private readonly object _gate = new();
     private bool _disposed;
-
-    /// <summary>When the current scan run started; null while not scanning.</summary>
-    public DateTime? RunningSinceUtc { get; private set; }
 
     public AdvertScanner(Func<string> nameMatch, Func<ulong?> identityAddress)
     {
@@ -85,7 +65,7 @@ internal sealed class AdvertScanner : IDisposable
         _watcher.Stopped += OnStopped;
     }
 
-    /// <summary>Raised (on a background thread) for each advertisement that may be the headphones.</summary>
+    /// <summary>Raised (on a background thread) for each advertisement from the headphones.</summary>
     public event Action<AdvertSeen>? Seen;
 
     /// <summary>
@@ -126,14 +106,12 @@ internal sealed class AdvertScanner : IDisposable
             {
                 _watcher.Start();
                 _started = true;
-                RunningSinceUtc = DateTime.UtcNow;
                 if (_retryStreak == 0)
                     Log.Info($"Advertisement scan started (nothing connected){(_watcher.AllowExtendedAdvertisements ? "" : ", legacy advertising only")}");
             }
             else if (!run && _started && status != BluetoothLEAdvertisementWatcherStatus.Stopping)
             {
                 _started = false;
-                RunningSinceUtc = null;
                 _watcher.Stop();
                 Log.Info("Advertisement scan stopped");
             }
@@ -166,7 +144,6 @@ internal sealed class AdvertScanner : IDisposable
         lock (_gate)
         {
             _started = false;
-            RunningSinceUtc = null;
             if (_disposed)
                 return;
 
@@ -182,7 +159,8 @@ internal sealed class AdvertScanner : IDisposable
                 // Adapters without extended advertising support abort the scan (Start itself does
                 // not throw). Fall back to legacy advertisements and try again right away.
                 _watcher.AllowExtendedAdvertisements = false;
-                Log.Info($"Advertisement scan aborted by Windows ({args.Error}) with extended advertising on: retrying with legacy only");
+                Log.Info($"Advertisement scan aborted by Windows ({args.Error}) with extended advertising on: retrying with legacy only. " +
+                         "Legacy advertisements carry no LE Audio announcement, so the wake on a Targeted announcement cannot fire.");
                 _ = Task.Run(() => Update(_shouldRun));
                 return;
             }
@@ -225,42 +203,30 @@ internal sealed class AdvertScanner : IDisposable
         try
         {
             var ad = args.Advertisement;
-            string match = _nameMatch();
             string name = ad.LocalName ?? "";
-            bool addressMatch = _identityAddress() == args.BluetoothAddress;
-            bool nameMatch = name.Length > 0 && name.Contains(match, StringComparison.OrdinalIgnoreCase);
-            bool bose = ad.ManufacturerData.Any(m => m.CompanyId == BoseCompanyId);
-            if (!addressMatch && !nameMatch && !bose)
+            ulong? identity = _identityAddress();
+            bool addressMatch = identity == args.BluetoothAddress;
+            // The headset advertises its own (identity) address, so once it is paired the address
+            // decides. The name is only a fallback while the paired entry is not known yet: another
+            // nearby headset of the same model must not start or extend episodes.
+            bool nameMatch = identity is null && name.Length > 0 &&
+                             name.Contains(_nameMatch(), StringComparison.OrdinalIgnoreCase);
+            if (!addressMatch && !nameMatch)
                 return;
 
-            string services = string.Join(",", ad.ServiceUuids.Select(ShortUuid));
             Seen?.Invoke(new AdvertSeen(
                 args.BluetoothAddress,
-                args.BluetoothAddressType.ToString(),
                 addressMatch,
-                nameMatch,
-                bose,
                 name,
                 args.RawSignalStrengthInDBm,
-                args.AdvertisementType.ToString(),
                 args.IsConnectable,
-                args.IsScanResponse,
-                services,
-                Payload(ad),
-                Announcement(ad)));
+                Announcement(ad),
+                Payload(ad)));
         }
         catch (Exception ex)
         {
             Log.Info($"Advertisement handling failed: {ex.Message}");
         }
-    }
-
-    private static string Payload(BluetoothLEAdvertisement ad)
-    {
-        // Flags (01) carry nothing useful and are left out.
-        return string.Join(" ", ad.DataSections
-            .Where(d => d.DataType != 0x01)
-            .Select(d => $"{d.DataType:X2}:{Hex(d.Data)}"));
     }
 
     private static LeAnnouncement Announcement(BluetoothLEAdvertisement ad)
@@ -283,23 +249,21 @@ internal sealed class AdvertScanner : IDisposable
         return result;
     }
 
+    /// <summary>
+    /// Compact raw content for the log: "type:hex" per section, without flags (01), name (09) and
+    /// TX power (0A). FF = manufacturer data (9E00 = Bose), 16 = service data.
+    /// </summary>
+    private static string Payload(BluetoothLEAdvertisement ad) =>
+        string.Join(" ", ad.DataSections
+            .Where(d => d.DataType is not (0x01 or 0x09 or 0x0A))
+            .Select(d => $"{d.DataType:X2}:{Convert.ToHexString(Bytes(d.Data))}"));
+
     private static byte[] Bytes(IBuffer buffer)
     {
         var bytes = new byte[buffer.Length];
         using (var reader = DataReader.FromBuffer(buffer))
             reader.ReadBytes(bytes);
         return bytes;
-    }
-
-    private static string Hex(IBuffer buffer) => Convert.ToHexString(Bytes(buffer));
-
-    // 0000184e-0000-1000-8000-00805f9b34fb -> 184E; anything else stays a full GUID.
-    private static string ShortUuid(Guid uuid)
-    {
-        string s = uuid.ToString();
-        return s.StartsWith("0000") && s.EndsWith("-0000-1000-8000-00805f9b34fb")
-            ? s.Substring(4, 4).ToUpperInvariant()
-            : s;
     }
 
     public void Dispose()
