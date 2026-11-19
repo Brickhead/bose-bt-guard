@@ -1,0 +1,11 @@
+# Build output
+bin/
+obj/
+out/
+
+# IDE / OS
+.vs/
+*.user
+*.suo
+.idea/
+Thumbs.db
