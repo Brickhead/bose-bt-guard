@@ -67,7 +67,23 @@ hangs skips the steps: only **Restart audio services** (button) or an app restar
 The tag `v0.1-full-diagnostics` has the earlier version with the advertisement payload
 window, payload logging, episode-cause guessing and the adapter restart step.
 
-## Build
+## Download
+
+Get `BtAudioGuard.exe` from the repository's **Releases** page (self-contained, no .NET install
+needed). Copy it to `C:\Tools\BtAudioGuard\` and, if Windows marks it as downloaded,
+Properties > Unblock.
+
+## Release a new version
+
+Push a version tag; GitHub Actions builds the exe and publishes the release
+(`.github/workflows/release.yml`). The tag sets the version shown in the app.
+
+```powershell
+git tag v1.0.1
+git push origin v1.0.1
+```
+
+## Build locally
 
 Requires the .NET 8 SDK and Windows 11. From the project folder:
 

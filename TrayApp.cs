@@ -24,7 +24,7 @@ internal sealed class TrayApp : ApplicationContext
 
     public TrayApp()
     {
-        Log.Info("BtAudioGuard started");
+        Log.Info($"BtAudioGuard {Program.Version} started");
         DevNode.RecoverPending(); // a device a previous run disabled and never re-enabled
         _settings = Settings.Load();
         _guardian = new Guardian(_settings);
@@ -48,7 +48,7 @@ internal sealed class TrayApp : ApplicationContext
         _tray = new NotifyIcon
         {
             Icon = _icons[GuardState.Starting],
-            Text = "BtAudioGuard",
+            Text = $"BtAudioGuard {Program.Version}",
             ContextMenuStrip = menu,
             Visible = true,
         };

@@ -53,7 +53,7 @@ internal sealed class MainForm : Form
     {
         _guardian = guardian;
 
-        Text = "BtAudioGuard";
+        Text = $"BtAudioGuard {Program.Version}";
         Font = new Font("Segoe UI", 9f);
         Size = new Size(1000, 720);
         MinimumSize = new Size(640, 480);
