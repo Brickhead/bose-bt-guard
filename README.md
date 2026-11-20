@@ -1,8 +1,12 @@
 # BtAudioGuard
 
 Tray app that keeps Bose QC Ultra 2 headphones working over Bluetooth LE Audio on Windows 11.
+Its 100% vibe coded using Claude.
 
 ## The problem
+
+When using the Bose On-head detection with Bluetooth LE putting down the headset will make it snooze.
+When the headset is used again Windows will only manage to reconnect to it some of the time, other times it just breaks and its impossible to reconnect even manually..
 
 All audio goes over the LE Audio link; the Classic link only carries the Bose app's control
 channel. Two failures:
