@@ -1,18 +1,29 @@
-# Builds the single-file exe and publishes it as a GitHub Release when a version tag is pushed:
+# Builds the single-file exe and publishes it as a GitHub Release.
+#
+# Normal way: push a version tag
 #   git tag v1.2.3
 #   git push origin v1.2.3
+# Fallback: Actions > Release > Run workflow, enter the version tag (created on the chosen
+# branch if it does not exist yet).
 name: Release
 
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Version tag to release, e.g. v1.0.0
+        required: true
 
 permissions:
-  contents: write # create the release and upload the exe
+  contents: write # create the release (and its tag) and upload the exe
 
 jobs:
   release:
     runs-on: windows-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
 
@@ -23,7 +34,7 @@ jobs:
       - name: Publish single-file exe
         shell: pwsh
         run: |
-          $version = "${{ github.ref_name }}".TrimStart('v')
+          $version = $env:TAG.TrimStart('v')
           dotnet publish BtAudioGuard.csproj -c Release -r win-x64 --self-contained true `
             -p:PublishSingleFile=true -p:Version=$version -o out
 
@@ -32,6 +43,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.ref_name }}" out/BtAudioGuard.exe diag.ps1 `
-            --title "BtAudioGuard ${{ github.ref_name }}" `
+          gh release create $env:TAG out/BtAudioGuard.exe diag.ps1 `
+            --target "${{ github.sha }}" `
+            --title "BtAudioGuard $env:TAG" `
             --generate-notes
