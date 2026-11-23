@@ -48,6 +48,16 @@ public sealed class Guardian : IDisposable
     // Set when an automatic fix run fails. Blocks the next automatic run for the cooldown, so a fix
     // that does not work is not repeated in a loop. Successful and manual runs do not set it.
     private DateTime _lastFailedAutoFixUtc = DateTime.MinValue;
+
+    // When the headphone output last turned Active. Seen in the field: right after that, Windows is
+    // often still setting up the LE Audio stream, and a test stream gets "device in use" or hangs
+    // for 10-20 s although nothing is broken. Failures in this window are re-checked, not fixed.
+    private long _outputActiveTicks;
+    private static readonly TimeSpan Warmup = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan WarmupMaxPerCheck = TimeSpan.FromSeconds(45);
+    private static readonly TimeSpan HungWaitBeforeStep = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan MaxFixRun = TimeSpan.FromMinutes(3);
+    private DateTime _lastHungRecheckUtc = DateTime.MinValue;
     private Dictionary<string, EndpointInfo> _endpoints = [];
 
     // Advertisement scan while nothing is connected. An "episode" is one unbroken run of
@@ -159,6 +169,7 @@ public sealed class Guardian : IDisposable
 
         _audio = new AudioEndpoints();
         _audio.Changed += OnEndpointNotification;
+        AudioEndpoints.HungProbeReturned += OnHungProbeReturned;
 
         _buildLife.Dispose();
         _buildLife = new CancellationTokenSource();
@@ -196,6 +207,7 @@ public sealed class Guardian : IDisposable
         _bluetooth.ListChanged -= OnBluetoothListChanged;
         _bluetooth.Dispose();
         _audio.Changed -= OnEndpointNotification;
+        AudioEndpoints.HungProbeReturned -= OnHungProbeReturned;
         _audio.Dispose();
         _scanner.Seen -= OnAdvertSeen;
         _scanner.Dispose();
@@ -236,6 +248,13 @@ public sealed class Guardian : IDisposable
                 {
                     if (_endpoints.TryGetValue(endpoint.Id, out var old) && old == endpoint)
                         continue;
+                    // A real transition only: an endpoint seen for the first time (app start, rebuild)
+                    // may have been active for hours.
+                    if (endpoint.Flow == DataFlow.Render && endpoint.State == DeviceState.Active &&
+                        old is { State: not DeviceState.Active })
+                    {
+                        MarkOutputActive();
+                    }
                     string kind = endpoint.Flow == DataFlow.Render ? "output" : "input";
                     string from = old is null ? "" : $"{old.State} -> ";
                     Log.Info($"Audio {kind}: {endpoint.Name}, state={from}{endpoint.State}, default={endpoint.IsDefault}");
@@ -568,9 +587,9 @@ public sealed class Guardian : IDisposable
             Log.Info($"Check queued ({reason}): waiting for active run");
             try
             {
-                if (!await _busy.WaitAsync(TimeSpan.FromMinutes(5), _lifetime.Token))
+                if (!await _busy.WaitAsync(TimeSpan.FromMinutes(10), _lifetime.Token))
                 {
-                    Log.Info($"Check dropped ({reason}): active run did not finish in 5 min");
+                    Log.Info($"Check dropped ({reason}): active run did not finish in 10 min");
                     return;
                 }
             }
@@ -599,14 +618,14 @@ public sealed class Guardian : IDisposable
                 SetState(GuardState.Checking, "testing audio stream");
             }
 
-            var result = await CheckAsync(setDefault: !watchdog);
+            var result = await CheckWithWarmupAsync(setDefault: !watchdog, quiet: watchdog);
             if (watchdog)
             {
                 if (result.Ok)
                 {
                     if (State != GuardState.Healthy)
                     {
-                        Log.Info($"Watchdog: audio OK again: {result.Detail}");
+                        Log.Info($"Audio OK again ({reason}): {result.Detail}");
                         SetState(GuardState.Healthy, result.Detail);
                     }
                     return;
@@ -626,12 +645,14 @@ public sealed class Guardian : IDisposable
 
             LogContext();
 
-            // A hung WASAPI call leaves a stuck thread in the audio stack. The fix steps cannot
-            // clear that; only an audio service restart or an app restart can.
+            // A test call that is still hung holds the output open: fix steps would be blocked by it
+            // (a driver restart gets vetoed) or disturb Windows while it is busy. Wait for it; when it
+            // returns, a new check runs by itself (OnHungProbeReturned).
             if (result.Hung)
             {
-                Log.Info("Audio stack hung: fix steps skipped. Use \"Restart audio services\", or restart the app.");
-                SetState(GuardState.Stalled, "audio stack hung: use Restart audio services, or restart the app");
+                Log.Info("Audio call hung: fix steps skipped while it runs. A new check starts when it returns " +
+                         "(or use \"Restart audio services\" if it never does).");
+                SetStalledByHang();
                 return;
             }
 
@@ -662,9 +683,15 @@ public sealed class Guardian : IDisposable
             // (Windows shows "Not connected"). There Wake LE link is the point: it connects them,
             // like the Connect button in Settings.
             bool mayRunDisconnected = manual && !connectedAtStart;
+            var fixStarted = DateTime.UtcNow;
             _fixing = true;
             foreach (var step in FixSteps())
             {
+                if (DateTime.UtcNow - fixStarted > MaxFixRun)
+                {
+                    Log.Info($"Fix run over {MaxFixRun.TotalMinutes:0} min: remaining steps skipped");
+                    break;
+                }
                 if (_lifetime.IsCancellationRequested)
                 {
                     Log.Info("Exiting: fix stopped");
@@ -677,6 +704,22 @@ public sealed class Guardian : IDisposable
                     return;
                 }
 
+                // A hung test call holds the output open; a step now would be blocked by it. Not when
+                // there is no active output at all (LE down): then Wake LE link is what is needed.
+                if (AudioEndpoints.ProbeHung && !result.NoEndpoint)
+                {
+                    Log.Info($"  Waiting up to {HungWaitBeforeStep.TotalSeconds:0} s for a hung audio call to return before \"{step.Name}\"");
+                    if (!await AudioEndpoints.WaitForHungProbeAsync(HungWaitBeforeStep))
+                    {
+                        Log.Info("  Audio call still hung: fix steps stopped (they would be blocked by it). " +
+                                 "A new check starts when it returns.");
+                        if (!manual)
+                            _lastFailedAutoFixUtc = DateTime.UtcNow; // no fix loop when it returns
+                        SetStalledByHang();
+                        return;
+                    }
+                }
+
                 SetState(GuardState.Fixing, step.Name);
                 Log.Info($"Fix step: {step.Name}");
 
@@ -686,7 +729,7 @@ public sealed class Guardian : IDisposable
                     continue;
 
                 await step.SettleAsync();
-                result = await CheckAsync(setDefault: !watchdog);
+                result = await CheckWithWarmupAsync(setDefault: !watchdog);
                 Log.Info($"  Re-check {(result.Ok ? "OK" : "FAILED")}: {result.Detail}");
                 if (result.Ok)
                 {
@@ -701,6 +744,10 @@ public sealed class Guardian : IDisposable
             LogContext();
             SetIdleState("all enabled fix steps failed");
         }
+        catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
+        {
+            // Exiting.
+        }
         catch (Exception ex)
         {
             Log.Info($"Run error: {ex}");
@@ -712,6 +759,108 @@ public sealed class Guardian : IDisposable
                 EndFix();
             _busy.Release();
         }
+    }
+
+    private void MarkOutputActive() => Interlocked.Exchange(ref _outputActiveTicks, DateTime.UtcNow.Ticks);
+
+    /// <summary>Time since the headphone output last turned Active; null if never seen.</summary>
+    private TimeSpan? SinceOutputActive()
+    {
+        long ticks = Interlocked.Read(ref _outputActiveTicks);
+        return ticks == 0 ? null : DateTime.UtcNow - new DateTime(ticks, DateTimeKind.Utc);
+    }
+
+    /// <summary>
+    /// The check, with a warm-up: within <see cref="Warmup"/> after the output turned Active, a
+    /// "device in use" answer or a hung call is taken as "still setting up" and re-checked (after
+    /// 5 s, or once the hung call returned) instead of being fixed. Other failures (a stalled
+    /// stream, no output) count at once. The deadline is fixed when the check starts and the
+    /// whole thing is capped, so a flapping output cannot stretch it.
+    /// </summary>
+    private async Task<CheckResult> CheckWithWarmupAsync(bool setDefault, bool quiet = false)
+    {
+        var started = DateTime.UtcNow;
+        var result = await CheckAsync(setDefault);
+        var since = SinceOutputActive();
+        if (result.Ok || !(result.Busy || result.Hung) || since is null || since >= Warmup)
+            return result;
+
+        var deadline = started + (Warmup - since.Value);
+        if (deadline > started + WarmupMaxPerCheck)
+            deadline = started + WarmupMaxPerCheck;
+
+        void Note(string line)
+        {
+            if (!quiet)
+                Log.Info(line);
+        }
+
+        while (!result.Ok && (result.Busy || result.Hung) && DateTime.UtcNow < deadline)
+        {
+            Note($"  Audio path still setting up (output Active for {(SinceOutputActive() ?? TimeSpan.Zero).TotalSeconds:0.0} s): {result.Detail}");
+            if (result.Hung)
+            {
+                var max = deadline - DateTime.UtcNow;
+                if (max < TimeSpan.FromSeconds(5))
+                    max = TimeSpan.FromSeconds(5);
+                Note($"  Waiting up to {max.TotalSeconds:0} s for the hung audio call to return");
+                if (!await AudioEndpoints.WaitForHungProbeAsync(max))
+                    return result with { Detail = $"{result.Detail}; still hung after waiting {max.TotalSeconds:0} s" };
+            }
+            else
+            {
+                Note("  Re-checking in 5 s");
+                await Task.Delay(TimeSpan.FromSeconds(5), _lifetime.Token);
+            }
+            result = await CheckAsync(setDefault);
+        }
+
+        Note(result.Ok
+            ? $"  Audio path ready {(DateTime.UtcNow - started).TotalSeconds:0} s after the first try (no fix needed)"
+            : $"  Warm-up over after {(DateTime.UtcNow - started).TotalSeconds:0} s, still failing");
+        return result;
+    }
+
+    /// <summary>
+    /// A test call that hung has returned. If the status is still "stalled" because of the hang:
+    /// when that call itself succeeded, the stream did start, so the status turns green without a
+    /// new test stream; otherwise one quiet re-check runs (no fix steps, no default-output change,
+    /// at most one every 2 min). That way a stuck stack cannot turn this into a probe or fix loop.
+    /// </summary>
+    private void OnHungProbeReturned(CheckResult returned)
+    {
+        if (State != GuardState.Stalled || !_bluetooth.AnyConnected)
+            return;
+        if (returned.Ok)
+        {
+            Log.Info($"Audio OK again (the hung call completed): {returned.Detail}");
+            SetState(GuardState.Healthy, returned.Detail);
+            return;
+        }
+        RecheckAfterHang();
+    }
+
+    private void RecheckAfterHang()
+    {
+        lock (_advertGate)
+        {
+            if (DateTime.UtcNow - _lastHungRecheckUtc < TimeSpan.FromMinutes(2))
+                return;
+            _lastHungRecheckUtc = DateTime.UtcNow;
+        }
+        _ = Task.Run(() => RunCoreAsync(fix: false, manual: false, "hung audio call returned", watchdog: true));
+    }
+
+    /// <summary>
+    /// Sets "stalled because a call hung". The call may have returned while the status was still
+    /// being set (context logging takes about a second); then its notice found no "stalled"
+    /// status and was dropped, so re-check here instead.
+    /// </summary>
+    private void SetStalledByHang()
+    {
+        SetState(GuardState.Stalled, "audio call hung: re-checking when it returns");
+        if (!AudioEndpoints.ProbeHung)
+            RecheckAfterHang();
     }
 
     private bool CooldownActive() =>
@@ -852,6 +1001,8 @@ public sealed class Guardian : IDisposable
         bool Abort() => classicAtStart && _bluetooth.ClassicDevice?.Connected != true;
 
         var (ok, detail) = await LeLink.WakeAsync(le.Id, EndpointActive, Settings.LeWakeHoldSeconds, Abort);
+        if (ok)
+            MarkOutputActive(); // the check right after must allow for the stream setup
         return ok ? (ok, detail) : (ok, $"{detail} ({EndpointSummary()})");
     }
 
@@ -871,6 +1022,7 @@ public sealed class Guardian : IDisposable
 
         if (EndpointActive())
         {
+            MarkOutputActive();
             Log.Info($"  Endpoint active {stopwatch.ElapsedMilliseconds} ms after driver restart");
         }
         else if (_bluetooth.AnyConnected)
@@ -927,7 +1079,7 @@ public sealed class Guardian : IDisposable
                 : "endpoint not active (" + string.Join(", ", endpoints.Select(e => $"{e.Name}={e.State}")) + ")";
             var le = _bluetooth.LeDevice;
             detail += le is null ? ", no LE entry" : $", LE link {(le.Connected ? "up" : "DOWN")}";
-            return new CheckResult(false, detail);
+            return new CheckResult(false, detail, NoEndpoint: true);
         }
 
         // Prefer the stereo "Headphones (...)" endpoint over a hands-free "Headset (...)" one.

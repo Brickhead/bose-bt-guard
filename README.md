@@ -48,6 +48,20 @@ releases it, so the headset can still switch itself off later.
 buffer within milliseconds, a stalled one never does (the condition that freezes video
 players). Runs after every connect and fix.
 
+**Warm-up.** Seen in the field: right after the output turns Active, a test stream can get
+"device in use" (0x8889000A) or hang, while a check some 20-30 s later passes with no fix
+in between. The likely cause is Windows still setting up the LE Audio stream; fixing then
+only restarts the setup. So for 30 s after the output turns Active (at most 45 s per check),
+"device in use" or a hang is re-checked instead of fixed: 5 s after "device in use" (plus the
+check's own time), or once a hung call has returned. Other failures (a stalled stream, no
+output) count at once.
+
+**Hung test calls.** No fix step runs while a test call is hung: it holds the output open (a
+driver restart was vetoed while one was hung). When a hung call returns, the log says after
+how long. If the status is still "stalled" because of it: when that call succeeded in the end,
+the status turns green; otherwise one quiet re-check runs (no fix steps, at most one every 2
+min). If a call never returns, use **Restart audio services** or restart the app.
+
 **Failure 2: watchdog.** While audio plays to the headphones, the check repeats every 60 s
 (setting, 0 = off). On failure the fix steps run in order, each followed by a check:
 
@@ -56,8 +70,8 @@ players). Runs after every connect and fix.
 3. **Restart LE Audio driver:** disable/enable the headphones' LE Audio driver node
    (`SWD\APXENUM...`), leaving the Bluetooth link alone
 
-A failed automatic fix starts a cooldown (90 s) so it does not loop. A WASAPI call that
-hangs skips the steps: only **Restart audio services** (button) or an app restart clears it.
+A failed automatic fix starts a cooldown (90 s) so it does not loop. A whole fix run stops
+after 3 minutes.
 
 **Safety.**
 - Fix steps stop when the headphones disconnect (taken off, switched off), so they do not
@@ -120,5 +134,3 @@ Start it now without logging off: `Start-ScheduledTask -TaskName "BtAudioGuard"`
 - Tray dot: grey = off / starting, yellow = checking, green = OK, orange = fixing, red = stalled.
 - Double-click the tray icon for the window: device list, manual actions, settings and live log.
 - Log file: `%AppData%\BtAudioGuard\log.txt`. Settings: `%AppData%\BtAudioGuard\settings.json`.
-- `diag.ps1`: snapshot of the headphones' device nodes and audio endpoints (run once while
-  audio works and once while it is broken, to compare).

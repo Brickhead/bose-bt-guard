@@ -7,9 +7,11 @@ namespace BtAudioGuard;
 
 public sealed record EndpointInfo(string Id, string Name, DataFlow Flow, DeviceState State, bool IsDefault);
 
-/// <param name="Hung">The audio stack did not return from a WASAPI call. Fix steps cannot help
-/// while that thread is stuck; only an audio service restart or an app restart can.</param>
-public sealed record CheckResult(bool Ok, string Detail, bool Hung = false);
+/// <param name="Hung">A WASAPI call did not return in time. Seen right after the output turned
+/// Active (Windows still setting up the LE Audio stream); such calls returned later.</param>
+/// <param name="Busy">WASAPI answered AUDCLNT_E_DEVICE_IN_USE: the output is not ready for a stream.</param>
+/// <param name="NoEndpoint">No active output at all (LE link down): not a "still setting up" case.</param>
+public sealed record CheckResult(bool Ok, string Detail, bool Hung = false, bool Busy = false, bool NoEndpoint = false);
 
 /// <summary>
 /// Core Audio side: finds the headphones' endpoints, forwards endpoint notifications,
@@ -19,6 +21,8 @@ public sealed class AudioEndpoints : IMMNotificationClient, IDisposable
 {
     private static readonly object HungGate = new();
     private static Task? _hungProbe;
+    private static DateTime _hungSinceUtc;
+    private const int AudclntDeviceInUse = unchecked((int)0x8889000A);
 
     private readonly MMDeviceEnumerator _enumerator = new();
 
@@ -72,6 +76,29 @@ public sealed class AudioEndpoints : IMMNotificationClient, IDisposable
     }
 
     /// <summary>
+    /// Raised (on a background thread) when a test call that hung has finally returned, with that
+    /// call's own result (OK means the stream did start in the end).
+    /// </summary>
+    public static event Action<CheckResult>? HungProbeReturned;
+
+    /// <summary>True while a test call that did not return in time is still running.</summary>
+    public static bool ProbeHung
+    {
+        get { lock (HungGate) return _hungProbe is { IsCompleted: false }; }
+    }
+
+    /// <summary>Waits (bounded) for a hung test call to return. True when none is hung any more.</summary>
+    public static async Task<bool> WaitForHungProbeAsync(TimeSpan max)
+    {
+        Task? hung;
+        lock (HungGate) hung = _hungProbe;
+        if (hung is null || hung.IsCompleted)
+            return true;
+        await Task.WhenAny(hung, Task.Delay(max));
+        return hung.IsCompleted;
+    }
+
+    /// <summary>
     /// Opens a shared-mode stream, fills the buffer with silence and starts it.
     /// A working endpoint drains the buffer within milliseconds. A stalled Bluetooth
     /// endpoint never drains it (or the WASAPI call itself hangs) – the same condition
@@ -81,21 +108,45 @@ public sealed class AudioEndpoints : IMMNotificationClient, IDisposable
     {
         lock (HungGate)
         {
-            // A hung WASAPI call never returns. Starting another one would only pile up threads
-            // (and open streams that may keep the headphones awake).
+            // Starting another call while one is stuck would only pile up threads (and open
+            // streams that may keep the headphones awake).
             if (_hungProbe is { IsCompleted: false })
-                return new CheckResult(false, "previous WASAPI call is still hung", Hung: true);
+            {
+                return new CheckResult(false,
+                    $"previous WASAPI call still hung ({(DateTime.UtcNow - _hungSinceUtc).TotalSeconds:0} s)", Hung: true);
+            }
             _hungProbe = null;
         }
 
         var window = TimeSpan.FromSeconds(seconds);
+        var elapsed = Stopwatch.StartNew();
         var task = Task.Run(() => TestStreamCore(endpointId, window));
 
-        // A hung WASAPI call is itself a failure. The worker thread is abandoned in that case.
+        // A call that does not return is itself a failure. The worker thread is left running.
         if (!task.Wait(window + TimeSpan.FromSeconds(5)))
         {
-            lock (HungGate) _hungProbe = task;
-            return new CheckResult(false, "WASAPI call hung, no return", Hung: true);
+            lock (HungGate)
+            {
+                _hungProbe = task;
+                _hungSinceUtc = DateTime.UtcNow - elapsed.Elapsed;
+            }
+            // Log when (if) it returns: that measures how long Windows actually needed.
+            _ = task.ContinueWith(t =>
+            {
+                var returned = t.IsCompletedSuccessfully
+                    ? t.Result
+                    : new CheckResult(false, t.Exception?.GetBaseException().Message ?? "failed");
+                Log.Info($"Hung audio call returned after {elapsed.Elapsed.TotalSeconds:0.0} s: {returned.Detail}");
+                try
+                {
+                    HungProbeReturned?.Invoke(returned);
+                }
+                catch (Exception ex)
+                {
+                    Log.Info($"Hung-call listener failed: {ex.Message}");
+                }
+            }, TaskScheduler.Default);
+            return new CheckResult(false, $"WASAPI call hung, no return after {elapsed.Elapsed.TotalSeconds:0} s", Hung: true);
         }
 
         return task.Result;
@@ -104,6 +155,7 @@ public sealed class AudioEndpoints : IMMNotificationClient, IDisposable
     private static CheckResult TestStreamCore(string endpointId, TimeSpan window)
     {
         string stage = "get device";
+        var total = Stopwatch.StartNew();
         try
         {
             var device = new MMDeviceEnumerator().GetDevice(endpointId);
@@ -113,6 +165,7 @@ public sealed class AudioEndpoints : IMMNotificationClient, IDisposable
             stage = "initialize";
             using var client = device.AudioClient;
             var format = client.MixFormat;
+            var init = Stopwatch.StartNew();
             client.Initialize(
                 AudioClientShareMode.Shared,
                 AudioClientStreamFlags.None,
@@ -120,6 +173,9 @@ public sealed class AudioEndpoints : IMMNotificationClient, IDisposable
                 0,
                 format,
                 Guid.Empty);
+            long initMs = init.ElapsedMilliseconds;
+            // A slow initialize means Windows was still busy with the output (logged as evidence).
+            string initNote = initMs > 300 ? $" (initialize took {initMs} ms)" : "";
 
             stage = "fill buffer";
             int bufferFrames = client.BufferSize;
@@ -145,7 +201,7 @@ public sealed class AudioEndpoints : IMMNotificationClient, IDisposable
                     Thread.Sleep(50);
                     padding = client.CurrentPadding;
                     if (padding < bufferFrames)
-                        return new CheckResult(true, $"stream OK, draining after {stopwatch.ElapsedMilliseconds} ms");
+                        return new CheckResult(true, $"stream OK, draining after {stopwatch.ElapsedMilliseconds} ms{initNote}");
                 }
 
                 // Stalled. Record what the engine did, so the log tells "clock frozen" (device
@@ -159,7 +215,7 @@ public sealed class AudioEndpoints : IMMNotificationClient, IDisposable
                     $"[padding {paddingStart}->{padding} of {bufferFrames} frames, " +
                     $"audio clock advanced {clockMs:0} ms, " +
                     $"format {format.SampleRate} Hz {format.Channels} ch {format.BitsPerSample} bit, " +
-                    $"period {client.DefaultDevicePeriod / 10_000.0:0.#} ms]");
+                    $"period {client.DefaultDevicePeriod / 10_000.0:0.#} ms]{initNote}");
             }
             finally
             {
@@ -168,7 +224,10 @@ public sealed class AudioEndpoints : IMMNotificationClient, IDisposable
         }
         catch (COMException ex)
         {
-            return new CheckResult(false, $"WASAPI error 0x{ex.HResult:X8} at '{stage}'");
+            bool busy = ex.HResult == AudclntDeviceInUse;
+            return new CheckResult(false,
+                $"WASAPI error 0x{ex.HResult:X8}{(busy ? " (device in use)" : "")} at '{stage}' after {total.ElapsedMilliseconds} ms",
+                Busy: busy);
         }
         catch (Exception ex)
         {
